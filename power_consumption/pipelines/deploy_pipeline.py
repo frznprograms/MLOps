@@ -7,9 +7,10 @@ from zenml.constants import DEFAULT_SERVICE_START_STOP_TIMEOUT
 from zenml.integrations.constants import MLFLOW
 from zenml.integrations.mlflow.model_deployers.mlflow_model_deployer import MLFlowModelDeployer
 from zenml.integrations.mlflow.services.mlflow_deployment import MLFlowDeploymentService
+from zenml.integrations.mlflow.steps import MLFlowDeploymentConfig
 from zenml.client import Client
 from zenml.integrations.mlflow.steps.mlflow_deployer import mlflow_model_deployer_step
-from mlflow.tracking import MlflowClient, artifact_utils
+from mlflow.tracking import MlflowClient
 from pydantic import BaseModel
 from steps.cleaning_step import clean_data
 from steps.ingestion_step import ingest_data
@@ -20,36 +21,57 @@ from steps.config import ModelConfig
 docker_settings = DockerSettings(required_integrations=[MLFLOW])
 DATA_PATH = "/Users/shaneryan_1/Downloads/MLOps/power_consumption/data/household_power_consumption.txt"
 MODEL_CONFIG = 'reg'
-URI = None
 
+# Deployment Trigger Configuration
 class DeploymentTriggerConfig(BaseModel):
     min_mse: float = 0.1
 
-class MLFlowDeploymentConfig(BaseModel):
-    name: str = 'shane-first-mlops-model'
-    description: str = 'example of regression model in production'
-    pipeline_name: str = get_step_context().pipeline_name
-    pipeline_step_name: str = get_step_context.step_name
-    model_uri: str = "runs:/<run_id>/model" or "models:/<model_name>/<model_version>"
-    model_name: str = 'regression model'
-    workers: int = 3
-    mlserver: bool = False
-    timeoutL: int = DEFAULT_SERVICE_START_STOP_TIMEOUT
-
 @step
 def deployment_trigger(mse: float, config: DeploymentTriggerConfig) -> bool:
-    # if condition is met, model can be deployed
+    """Step to decide whether to deploy the model based on performance."""
     return mse < config.min_mse
 
-@step(enable_cache=False)
+@step
+def deploy_model_service(
+    run_id: str,
+    pipeline_name: str,
+    pipeline_step_name: str,
+    model_name: str = "model"
+) -> MLFlowDeploymentService:
+    """Deploy a model using the MLflow Model Deployer."""
+    # Fetch the artifact URI for the model using the run_id
+    client = MlflowClient()
+    model_uri = client.get_run(run_id).info.artifact_uri + f"/{model_name}"
+    
+    zenml_client = Client()
+    model_deployer = zenml_client.active_stack.model_deployer
+
+    mlflow_deployment_config = MLFlowDeploymentConfig(
+        name="mlops-model-deployment",
+        description="Deployed regression model",
+        pipeline_name=pipeline_name,
+        pipeline_step_name=pipeline_step_name,
+        model_uri=model_uri,
+        model_name=model_name,
+        workers=3,
+        mlserver=False,
+        timeout=DEFAULT_SERVICE_START_STOP_TIMEOUT,
+    )
+
+    service = model_deployer.deploy_model(
+        config=mlflow_deployment_config, 
+        service_type=MLFlowDeploymentService.SERVICE_TYPE
+    )
+    logging.info(f"Deployed model service: {service.endpoint}")
+    return service
+
+@step
 def prediction_service_loader(
     pipeline_name: str, pipeline_step_name: str, running: bool = True, model_name: str = "model"
-) -> MLFlowDeploymentConfig:
-    ''' Get the prediction service started by the deployment pipeline '''
-    # get the mlflow model deployer stack component
+) -> MLFlowDeploymentService:
+    """Load an MLflow prediction service that is already running."""
     model_deployer = MLFlowModelDeployer.get_active_model_deployer()
 
-    # fetch existing services with the same pipeline name, step name and model name
     existing_services = model_deployer.find_model_server(
         pipeline_name=pipeline_name,
         pipeline_step_name=pipeline_step_name,
@@ -63,112 +85,50 @@ def prediction_service_loader(
             f"{pipeline_step_name} step in the {pipeline_name} pipeline "
             f"for the {model_name} model is currently running."
         )
-
-    print(existing_services)
-    print(type(existing_services))
     return existing_services[0]
 
 @step
 def predictor(service: MLFlowDeploymentService, data: pd.DataFrame) -> np.ndarray:
+    """Use the deployed model service to make predictions."""
     service.start(timeout=10)
-    data.drop(columns=['Global_reactive_power'], axis=1, inplace=True)
+    data.drop(columns=["Global_reactive_power"], axis=1, inplace=True)
     data = data.to_numpy()
-    prediction = service.predict(data)
-    return prediction
-
-@step
-# if artifact uri is known
-def deploy_model() -> MLFlowDeploymentService:
-    zenml_client = Client()
-    model_deployer = zenml_client.active_stack.model_deployer
-    mlflow_deployment_config = MLFlowDeploymentConfig(
-        name= 'shane-first-mlops-model',
-        description = 'example of regression model in production',
-        pipeline_name= get_step_context().pipeline_name,
-        pipeline_step_name = get_step_context.step_name,
-        model_uri = "runs:/<run_id>/model" or "models:/<model_name>/<model_version>",
-        model_name = 'regression model',
-        workers = 3,
-        mlserver = False,
-        timeout = DEFAULT_SERVICE_START_STOP_TIMEOUT,
-    )
-
-    service = model_deployer.deploy_model(
-        config=mlflow_deployment_config,
-        service_type=MLFlowDeploymentService.SERVICE_TYPE
-    )
-    logging.info(f"The deployed service info: {model_deployer.get_model_server_info(service)}")
-    
-    return service
-
-
-@step
-# if artifact uri is known
-def deploy_model() -> MLFlowDeploymentService:
-    # Deploy a model using the MLflow Model Deployer
-    zenml_client = Client()
-    model_deployer = zenml_client.active_stack.model_deployer
-    experiment_tracker = zenml_client.active_stack.experiment_tracker
-    # Let's get the run id of the current pipeline
-    mlflow_run_id = experiment_tracker.get_run_id(
-        experiment_name=get_step_context().pipeline_name,
-        run_name=get_step_context().run_name,
-    )
-    # Once we have the run id, we can get the model URI using mlflow client
-    experiment_tracker.configure_mlflow()
-    client = MlflowClient()
-    model_name = "model" # set the model name that was logged
-    model_uri = artifact_utils.get_artifact_uri(
-        run_id=mlflow_run_id, artifact_path=model_name
-    )
-    mlflow_deployment_config = MLFlowDeploymentConfig(
-        name= 'shane-first-mlops-model',
-        description = 'example of regression model in production',
-        pipeline_name= get_step_context().pipeline_name,
-        pipeline_step_name = get_step_context.step_name,
-        model_uri = "runs:/<run_id>/model" or "models:/<model_name>/<model_version>",
-        model_name = 'regression model',
-        workers = 3,
-        mlserver = False,
-        timeout = DEFAULT_SERVICE_START_STOP_TIMEOUT,
-    )
-    service = model_deployer.deploy_model(
-        config=mlflow_deployment_config, 
-        service_type=MLFlowDeploymentService.SERVICE_TYPE
-    )
-    return service
-
-
-
-
-
+    predictions = service.predict(data)
+    return predictions
 
 
 ##################################################################
+# Continuous Deployment Pipeline
 @pipeline(enable_cache=True, settings={"docker": docker_settings})
-def continuous_deployment(min_acc: float = 0.5, workers: int = 1, timeout: int = DEFAULT_SERVICE_START_STOP_TIMEOUT):
+def continuous_deployment_pipeline(min_mse: float = 0.1, workers: int = 1, timeout: int = DEFAULT_SERVICE_START_STOP_TIMEOUT):
+    """Pipeline for continuous deployment of models."""
     data = ingest_data(DATA_PATH)
     config = ModelConfig(task=MODEL_CONFIG)
     cleaned_data = clean_data(data)
-    if config.task == 'reg':
+
+    if config.task == "reg":
         res = train_model_reg(cleaned_data, config=MODEL_CONFIG)
         performance_metrics = evaluate_regressor(res)
-    
-    deployment_decision = deployment_trigger(acc = performance_metrics)
-    mlflow_model_deployer_step(
-        model=res,
-        deploy_decision=deployment_decision,
-        workers=workers,
-        timeout=timeout
-    )
 
+    # Decide on deployment
+    deploy_decision = deployment_trigger(mse=performance_metrics, config=DeploymentTriggerConfig(min_mse=min_mse))
+    
+    # if deploy_decision is True
+    if deploy_decision:
+        deploy_model_service(
+            model_uri="runs:/<run_id>/model" or "models:/<model_name>/<model_version>",
+            pipeline_name=get_step_context().pipeline_name,
+            pipeline_step_name=get_step_context().step_name,
+            model_name="regression model",
+        )
+
+# Inference Deployment Pipeline
 @pipeline(enable_cache=False, settings={"docker": docker_settings})
-def inference_deployment(pipeline_name: str, pipeline_step_name: str):
-    # Link all the steps artifacts together
+def inference_deployment_pipeline(pipeline_name: str, pipeline_step_name: str):
+    """Pipeline for inference using a deployed model."""
     data = ingest_data(DATA_PATH)
-    model_deployment_service = prediction_service_loader(
-        pipeline_name=pipeline_name,
-        pipeline_step_name=pipeline_step_name,
-        running=False,
+    service = prediction_service_loader(
+        pipeline_name=pipeline_name, pipeline_step_name=pipeline_step_name
     )
-    predictor(service=model_deployment_service, data=data) 
+    predictions = predictor(service=service, data=data)
+    return predictions
