@@ -5,7 +5,6 @@ from zenml import step
 from zenml.client import Client
 from .datatypes import ModelAndData
 from orchestrations.evaluations import RegressionMetrics
-from sklearn.base import RegressorMixin, ClusterMixin
 from sklearn.metrics import silhouette_score
 import mlflow
 
